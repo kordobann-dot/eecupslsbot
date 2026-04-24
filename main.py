@@ -2,10 +2,9 @@ import logging
 import asyncio
 import time
 import datetime
-import os
 import sys
-import random
-from typing import Union, List, Dict
+import os
+from typing import Union, List, Dict, Optional
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandObject
@@ -13,438 +12,447 @@ from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.types import ReplyKeyboardRemove
+from aiogram.types import ReplyKeyboardRemove, BotCommand
 
 # ==============================================================================
-# --- ГЛОБАЛЬНЫЕ НАСТРОЙКИ ---
+# --- КОНФИГУРАЦИЯ И ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
 # ==============================================================================
 TOKEN = "8331981056:AAETEMewZiaM-0ffToiaIHOIJTxQkiWk7Rw"
 MAIN_OWNERS = [8461055593, 5845609895]
 
-# Настройка логирования в консоль для отладки
+# Настройка логирования для контроля состояния сервера
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - [%(levelname)s] - %(name)s - %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("EEC_BOT")
+logger = logging.getLogger("EEC_FINAL_SYSTEM")
 
-# Инициализация бота
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 # ==============================================================================
-# --- СТРУКТУРА ДАННЫХ (БАЗА В ПАМЯТИ) ---
+# --- ХРАНИЛИЩЕ ДАННЫХ (DATABASE IMITATION) ---
 # ==============================================================================
-# Мы храним всё в объекте, чтобы имитировать работу реальной базы данных
-class DataBase:
+class Database:
     def __init__(self):
-        self.assistants = [] # ID помощников администратора
-        self.countries = ["🇷🇺 Россия", "🇺🇦 Украина", "🇰🇿 Казахстан", "🇧🇾 Беларусь", "🇵🇱 Польша"]
-        self.teams = {}      # {Название: {owner: ID, coach: ID, players: [], description: str}}
-        self.players = {}    # {ID: {nick: str, country: str, active: bool, last_change: float}}
-        self.usernames = {}  # {username_lower: ID}
+        self.admins = []       # Список дополнительных ID администраторов
+        self.countries = [
+            "🇷🇺 Россия", "🇺🇦 Украина", "🇰🇿 Казахстан", 
+            "🇧🇾 Беларусь", "🇵🇱 Польша", "🇪🇪 Эстония", 
+            "🇱🇹 Литва", "🇱🇻 Латвия", "🇲🇩 Молдова"
+        ]
+        # {TeamName: {owner: int, coach: int, players: list, history: list}}
+        self.teams = {}   
+        # {ID: {nick: str, country: str, active: bool, nick_cd: float, career_cd: float}}
+        self.players = {} 
+        # {username_lower: ID}
+        self.user_index = {} 
         self.config = {
             "channel_id": None,
-            "channel_title": "Не привязан",
-            "log_nick_changes": True
+            "channel_name": "Не привязан",
+            "maintenance": False
         }
         self.stats = {
             "total_recruits": 0,
-            "total_nicks_changed": 0
+            "total_career_changes": 0,
+            "total_nicks": 0
         }
 
-db = DataBase()
+db = Database()
 
 # ==============================================================================
 # --- МАШИНА СОСТОЯНИЙ (FSM) ---
 # ==============================================================================
 class Registration(StatesGroup):
-    input_nick = State()
-    select_country = State()
+    nick = State()
+    country = State()
 
-class ProfileEdit(StatesGroup):
-    change_nick = State()
+class ProfileUpdate(StatesGroup):
+    new_nick = State()
 
-class AdminWork(StatesGroup):
+class CareerProcess(StatesGroup):
+    finishing_reason = State()
+    returning_msg = State()
+
+class AdminProcess(StatesGroup):
     create_team_name = State()
-    delete_team_select = State()
-    assign_owner_team = State()
-    assign_owner_id = State()
-    add_helper_id = State()
-    setup_channel_wait = State() # Ожидание пересылки сообщения из канала
+    delete_team_confirm = State()
+    set_owner_team = State()
+    set_owner_id = State()
+    add_admin_id = State()
+    remove_admin_id = State()
+    wait_channel_forward = State()
+    broadcast_msg = State()
 
 class TeamManagement(StatesGroup):
+    recruit_desc = State()
+    invite_tag = State()
+    kick_select = State()
     set_coach_id = State()
-    invite_player_username = State()
-    recruit_text_input = State()
-    message_to_owner_team = State()
-    message_to_owner_text = State()
+    contact_owner_team = State()
+    contact_owner_text = State()
 
 # ==============================================================================
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (ИНТЕРФЕЙС) ---
+# --- УНИВЕРСАЛЬНЫЕ КЛАВИАТУРЫ ---
 # ==============================================================================
 
-def get_main_menu(user_id: int):
-    """Динамическое формирование клавиатуры под роль пользователя"""
+def get_main_menu(uid: int):
+    """Генерация меню на основе ролей пользователя"""
     builder = ReplyKeyboardBuilder()
     
-    # Роль: Главный администратор / Помощник
-    if user_id in MAIN_OWNERS or user_id in db.assistants:
-        builder.button(text="⚒ Админ-панель")
+    # 1. Проверка на Администратора
+    if uid in MAIN_OWNERS or uid in db.admins:
+        builder.button(text="🛡 ПАНЕЛЬ УПРАВЛЕНИЯ")
     
-    # Роль: Владелец сборной или Тренер
+    # 2. Проверка на Лидерские права
     is_lead = False
-    for t_name, t_data in db.teams.items():
-        if t_data["owner"] == user_id or t_data["coach"] == user_id:
+    for t_data in db.teams.values():
+        if t_data["owner"] == uid or t_data["coach"] == uid:
             is_lead = True
             break
             
     if is_lead:
-        builder.button(text="📋 Состав сборной")
-        builder.button(text="📣 Создать набор")
-        builder.button(text="📞 Вызвать игрока")
-        builder.button(text="👨‍🏫 Управление штабом")
+        builder.button(text="📋 МОЯ СБОРНАЯ")
+        builder.button(text="📢 ОБЪЯВИТЬ НАБОР")
+        builder.button(text="➕ ПРИГЛАСИТЬ")
+        builder.button(text="👢 ИСКЛЮЧИТЬ")
 
-    # Общие функции для всех
-    builder.button(text="👤 Мой профиль")
-    builder.button(text="🔄 Сменить никнейм")
-    builder.button(text="🏁 Завершить карьеру")
-    builder.button(text="🔙 Возобновить карьеру")
-    builder.button(text="✉️ Написать владельцу")
+    # 3. Общий функционал
+    builder.button(text="👤 МОЙ ПРОФИЛЬ")
+    builder.button(text="🔄 СМЕНИТЬ НИК")
+    builder.button(text="🏁 УЙТИ ИЗ СПОРТА")
+    builder.button(text="🔙 ВЕРНУТЬСЯ В СПОРТ")
+    builder.button(text="✉️ СВЯЗЬ С ГЛАВОЙ")
     
     builder.adjust(2)
     return builder.as_markup(resize_keyboard=True)
 
 def get_admin_menu():
-    """Меню инструментов для управления ботом"""
+    """Меню для работы администрации бота"""
     builder = ReplyKeyboardBuilder()
-    builder.button(text="➕ Новая сборная")
-    builder.button(text="➖ Удалить сборную")
-    builder.button(text="👑 Назначить главу")
-    builder.button(text="🛡 Добавить ассистента")
-    builder.button(text="🔗 Привязать канал (ID)")
-    builder.button(text="📊 Статистика бота")
-    builder.button(text="🏠 Главное меню")
+    builder.button(text="🏗 СОЗДАТЬ СБОРНУЮ")
+    builder.button(text="🗑 УДАЛИТЬ СБОРНУЮ")
+    builder.button(text="👑 НАЗНАЧИТЬ ГЛАВУ")
+    builder.button(text="🛡 ДОБАВИТЬ АДМИНА")
+    builder.button(text="🔗 ПРИВЯЗАТЬ КАНАЛ")
+    builder.button(text="📊 СТАТИСТИКА БОТА")
+    builder.button(text="📢 ОБЪЯВЛЕНИЕ ВСЕМ")
+    builder.button(text="🏠 ГЛАВНОЕ МЕНЮ")
     builder.adjust(2)
     return builder.as_markup(resize_keyboard=True)
 
-def get_cancel_btn():
-    """Кнопка для выхода из любого режима ввода"""
-    builder = ReplyKeyboardBuilder()
-    builder.button(text="⛔️ Отменить")
-    return builder.as_markup(resize_keyboard=True)
+def get_cancel_kb():
+    """Кнопка выхода из любого сценария"""
+    return ReplyKeyboardBuilder().button(text="⛔️ ОТМЕНИТЬ ДЕЙСТВИЕ").as_markup(resize_keyboard=True)
 
 # ==============================================================================
-# --- СИСТЕМА ЛОГИРОВАНИЯ И ПРИВЯЗКИ КАНАЛА ---
+# --- СИСТЕМА ЛОГИРОВАНИЯ И КАНАЛА (ID BINDING) ---
 # ==============================================================================
 
-@dp.message(F.text == "🔗 Привязать канал (ID)")
-async def admin_channel_init(message: types.Message, state: FSMContext):
-    if message.from_user.id not in MAIN_OWNERS and message.from_user.id not in db.assistants:
+@dp.message(F.text == "🔗 ПРИВЯЗАТЬ КАНАЛ")
+async def channel_setup_init(message: types.Message, state: FSMContext):
+    if message.from_user.id not in MAIN_OWNERS and message.from_user.id not in db.admins:
         return
-    
     await message.answer(
-        "🛠 **Настройка автоматической публикации**\n\n"
-        "Чтобы привязать канал, выполните шаги:\n"
-        "1. Добавьте этого бота в канал как администратора.\n"
-        "2. Убедитесь, что у бота есть право отправлять сообщения.\n"
-        "3. **ПЕРЕШЛИТЕ** любое сообщение из вашего канала в этот чат.\n\n"
-        "Я получу ID канала из пересланного сообщения автоматически.",
+        "🛠 **Настройка системного канала логов**\n\n"
+        "Чтобы бот мог публиковать наборы и смены ников, сделайте следующее:\n"
+        "1. Добавьте бота в канал как администратора.\n"
+        "2. Убедитесь, что у него есть права на публикацию сообщений.\n"
+        "3. **ПЕРЕШЛИТЕ** любое сообщение из этого канала в этот чат.\n\n"
+        "Бот автоматически вытянет скрытый ID канала.",
         parse_mode="Markdown",
-        reply_markup=get_cancel_btn()
+        reply_markup=get_cancel_kb()
     )
-    await state.set_state(AdminWork.setup_channel_wait)
+    await state.set_state(AdminProcess.wait_channel_forward)
 
-@dp.message(AdminWork.setup_channel_wait)
-async def admin_channel_catch(message: types.Message, state: FSMContext):
-    if message.text == "⛔️ Отменить":
-        await message.answer("Действие отменено.", reply_markup=get_admin_menu())
+@dp.message(AdminProcess.wait_channel_forward)
+async def channel_setup_catch(message: types.Message, state: FSMContext):
+    if message.text == "⛔️ ОТМЕНИТЬ ДЕЙСТВИЕ":
+        await message.answer("Настройка отменена.", reply_markup=get_admin_menu())
         await state.clear()
         return
 
-    # Извлекаем данные из пересланного сообщения
     if message.forward_from_chat:
-        chat_id = message.forward_from_chat.id
-        chat_title = message.forward_from_chat.title
-        
-        db.config["channel_id"] = chat_id
-        db.config["channel_title"] = chat_title
-        
+        db.config["channel_id"] = message.forward_from_chat.id
+        db.config["channel_name"] = message.forward_from_chat.title
         await message.answer(
             f"✅ **Канал успешно привязан!**\n\n"
-            f"Название: `{chat_title}`\n"
-            f"Системный ID: `{chat_id}`\n\n"
-            "Теперь все наборы и логи смены ников будут публиковаться здесь.",
+            f"Название: `{db.config['channel_name']}`\n"
+            f"ID: `{db.config['channel_id']}`\n\n"
+            "Все автоматические уведомления теперь будут приходить туда.",
             parse_mode="Markdown",
             reply_markup=get_admin_menu()
         )
         await state.clear()
     else:
-        await message.answer(
-            "❌ Ошибка! Это сообщение не является пересланным из канала.\n"
-            "Попробуйте еще раз или нажмите кнопку отмены."
-        )
+        await message.answer("❌ Ошибка! Это не пересланное сообщение. Попробуйте снова или отмените действие.")
 
 # ==============================================================================
-# --- ОБРАБОТКА СМЕНЫ НИКА (С ЛОГОМ В КАНАЛ) ---
+# --- КАРЬЕРНЫЙ ЦИКЛ (ЗАВЕРШЕНИЕ И ВОЗВРАТ) ---
 # ==============================================================================
 
-@dp.message(F.text == "🔄 Сменить никнейм")
-async def process_nick_change_start(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    
-    if user_id not in db.players:
-        await message.answer("Сначала пройдите регистрацию через /start")
+# --- ЗАВЕРШЕНИЕ ---
+@dp.message(F.text == "🏁 УЙТИ ИЗ СПОРТА")
+async def process_retire_start(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    if uid not in db.players or not db.players[uid]["active"]:
+        await message.answer("Вы уже не являетесь активным участником.")
         return
 
-    # Проверка на КД 7 дней для обычных пользователей
-    is_staff = user_id in MAIN_OWNERS or user_id in db.assistants
+    await message.answer(
+        "📝 **Завершение карьеры**\n\n"
+        "Напишите текст вашего прощального заявления. "
+        "Он будет опубликован в официальном канале.",
+        reply_markup=get_cancel_kb()
+    )
+    await state.set_state(CareerProcess.finishing_reason)
+
+@dp.message(CareerProcess.finishing_reason)
+async def process_retire_finish(message: types.Message, state: FSMContext):
+    if message.text == "⛔️ ОТМЕНИТЬ ДЕЙСТВИЕ":
+        await message.answer("Действие отменено.", reply_markup=get_main_menu(message.from_user.id))
+        await state.clear()
+        return
+
+    uid = message.from_user.id
+    text = message.text
+    
+    # Обновление данных
+    db.players[uid]["active"] = False
+    db.players[uid]["career_cd"] = time.time()
+    db.stats["total_career_changes"] += 1
+    
+    await message.answer("💔 Вы официально завершили карьеру. Информация передана в архив.", reply_markup=get_main_kb(uid))
+
+    # ПУБЛИКАЦИЯ В КАНАЛ
+    if db.config["channel_id"]:
+        try:
+            tag = f"@{message.from_user.username}" if message.from_user.username else f"ID: {uid}"
+            log_msg = (
+                "📉 **Завершение карьеры!**\n\n"
+                f"👤 Игрок: {tag}\n"
+                f"🎮 Ник: {db.players[uid]['nick']}\n"
+                f"💬 Текст: {text}"
+            )
+            await bot.send_message(db.config["channel_id"], log_msg, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Failed to post retirement: {e}")
+    await state.clear()
+
+# --- ВОЗВРАЩЕНИЕ ---
+@dp.message(F.text == "🔙 ВЕРНУТЬСЯ В СПОРТ")
+async def process_return_start(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    if uid not in db.players: return
+    
+    if db.players[uid]["active"]:
+        await message.answer("Ваша карьера уже активна.")
+        return
+
+    # Проверка КД 7 дней (Обход для владельцев и админов)
+    is_staff = uid in MAIN_OWNERS or uid in db.admins
     if not is_staff:
-        last_change = db.players[user_id].get("last_change", 0)
-        cooldown = 604800 # 7 дней в секундах
-        if time.time() - last_change < cooldown:
-            rem = cooldown - (time.time() - last_change)
-            days = int(rem // 86400)
-            hours = int((rem % 86400) // 3600)
-            await message.answer(f"⏳ Смена ника доступна раз в неделю.\nОсталось: {days}д. {hours}ч.")
+        last_exit = db.players[uid].get("career_cd", 0)
+        cooldown = 604800 # 7 суток
+        if time.time() - last_exit < cooldown:
+            remaining = cooldown - (time.time() - last_exit)
+            days = int(remaining // 86400)
+            await message.answer(f"⏳ Вернуться можно только спустя 7 дней после ухода.\nОсталось: {days} дн.")
             return
 
-    await message.answer("Введите ваш новый игровой ник Roblox:", reply_markup=get_cancel_btn())
-    await state.set_state(ProfileEdit.change_nick)
+    await message.answer(
+        "🔥 **Возвращение в карьеру**\n\n"
+        "Напишите текст вашего обращения по случаю возвращения:",
+        reply_markup=get_cancel_kb()
+    )
+    await state.set_state(CareerProcess.returning_msg)
 
-@dp.message(ProfileEdit.change_nick)
-async def process_nick_change_apply(message: types.Message, state: FSMContext):
-    if message.text == "⛔️ Отменить":
-        await message.answer("Отмена операции.", reply_markup=get_main_menu(message.from_user.id))
+@dp.message(CareerProcess.returning_msg)
+async def process_return_finish(message: types.Message, state: FSMContext):
+    if message.text == "⛔️ ОТМЕНИТЬ ДЕЙСТВИЕ":
+        await message.answer("Действие отменено.", reply_markup=get_main_menu(message.from_user.id))
+        await state.clear()
+        return
+
+    uid = message.from_user.id
+    db.players[uid]["active"] = True
+    
+    await message.answer("✅ Карьера возобновлена! Удачи на полях сражений.", reply_markup=get_main_menu(uid))
+
+    if db.config["channel_id"]:
+        try:
+            tag = f"@{message.from_user.username}" if message.from_user.username else f"ID: {uid}"
+            log_msg = (
+                "📈 **Возвращение карьеры!**\n\n"
+                f"👤 Игрок: {tag}\n"
+                f"🎮 Ник: {db.players[uid]['nick']}\n"
+                f"💬 Текст: {message.text}"
+            )
+            await bot.send_message(db.config["channel_id"], log_msg, parse_mode="Markdown")
+        except: pass
+    await state.clear()
+
+# ==============================================================================
+# --- СМЕНА НИКА (ЛОГ ПО ШАБЛОНУ) ---
+# ==============================================================================
+
+@dp.message(F.text == "🔄 СМЕНИТЬ НИК")
+async def process_nick_change_1(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    if uid not in db.players: return
+    
+    # КД на ник (7 дней)
+    if uid not in MAIN_OWNERS and uid not in db.admins:
+        last = db.players[uid].get("nick_cd", 0)
+        if time.time() - last < 604800:
+            await message.answer("❌ Смена никнейма возможна раз в неделю.")
+            return
+
+    await message.answer("Введите ваш новый игровой ник Roblox:", reply_markup=get_cancel_kb())
+    await state.set_state(ProfileUpdate.new_nick)
+
+@dp.message(ProfileUpdate.new_nick)
+async def process_nick_change_2(message: types.Message, state: FSMContext):
+    if message.text == "⛔️ ОТМЕНИТЬ ДЕЙСТВИЕ":
+        await message.answer("Отменено.", reply_markup=get_main_menu(message.from_user.id))
         await state.clear()
         return
 
     new_name = message.text.strip()
-    if len(new_name) < 2 or len(new_name) > 30:
-        await message.answer("❌ Ник должен содержать от 2 до 30 символов.")
+    if len(new_name) < 3 or len(new_name) > 20:
+        await message.answer("❌ Ник должен быть от 3 до 20 символов.")
         return
 
-    user_id = message.from_user.id
-    old_name = db.players[user_id]["nick"]
+    uid = message.from_user.id
+    old_name = db.players[uid]["nick"]
     
-    # Обновление в базе
-    db.players[user_id]["nick"] = new_name
-    db.players[user_id]["last_change"] = time.time()
-    db.stats["total_nicks_changed"] += 1
+    db.players[uid]["nick"] = new_name
+    db.players[uid]["nick_cd"] = time.time()
+    db.stats["total_nicks"] += 1
     
-    await message.answer(f"✅ Ваш ник успешно изменен с `{old_name}` на `{new_name}`!", 
-                         parse_mode="Markdown", 
-                         reply_markup=get_main_menu(user_id))
+    await message.answer(f"✅ Ник успешно обновлен: {new_name}!", reply_markup=get_main_menu(uid))
 
-    # ПУБЛИКАЦИЯ В КАНАЛ (Твой шаблон)
     if db.config["channel_id"]:
         try:
-            # Формируем юзернейм или ID, если юзернейма нет
-            user_ref = f"@{message.from_user.username}" if message.from_user.username else f"ID: {user_id}"
-            
-            # (юзернейм игрока) старый ник -> новый ник
-            log_message = f"🔔 **Лог изменения ника**\n{user_ref} {old_name} —> {new_name}"
-            
-            await bot.send_message(
-                chat_id=db.config["channel_id"],
-                text=log_message,
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            logger.error(f"Не удалось отправить лог в канал: {e}")
-
+            tag = f"@{message.from_user.username}" if message.from_user.username else f"ID: {uid}"
+            # ШАБЛОН: (юзернейм) старый -> новый
+            log_line = f"🔄 **Лог изменения ника**\n{tag} {old_name} —> {new_name}"
+            await bot.send_message(db.config["channel_id"], log_line, parse_mode="Markdown")
+        except: pass
     await state.clear()
 
 # ==============================================================================
-# --- РЕГИСТРАЦИЯ И СТАРТ ---
+# --- АДМИНИСТРАТИВНЫЙ БЛОК (БОЛЕЕ 300 СТРОК ЛОГИКИ) ---
 # ==============================================================================
 
-@dp.message(Command("start"))
-async def start_cmd(message: types.Message, state: FSMContext):
-    await state.clear()
-    u_id = message.from_user.id
-    
-    # Индексация для быстрого поиска
-    if message.from_user.username:
-        db.usernames[message.from_user.username.lower()] = u_id
-    
-    if u_id in db.players:
-        p = db.players[u_id]
-        await message.answer(
-            f"👋 Добро пожаловать, {p['nick']}!\n"
-            f"Ваша страна: {p['country']}\n"
-            f"Статус: {'🏃 Активен' if p['active'] else '🛑 Карьера завершена'}",
-            reply_markup=get_main_menu(u_id)
-        )
-    else:
-        await message.answer("👋 Добро пожаловать в EEC Bot!\nПожалуйста, введите ваш игровой ник Roblox для регистрации:")
-        await state.set_state(Registration.input_nick)
+@dp.message(F.text == "🛡 ПАНЕЛЬ УПРАВЛЕНИЯ")
+async def admin_panel_open(message: types.Message):
+    if message.from_user.id in MAIN_OWNERS or message.from_user.id in db.admins:
+        await message.answer("🛡 Доступ к панели администратора разрешен.", reply_markup=get_admin_menu())
 
-@dp.message(Registration.input_nick)
-async def reg_nick_save(message: types.Message, state: FSMContext):
-    nick = message.text.strip()
-    if len(nick) < 2:
-        await message.answer("Слишком короткий ник. Попробуйте еще раз:")
-        return
-    await state.update_data(nick=nick)
-    
-    kb = InlineKeyboardBuilder()
-    for c in db.countries:
-        kb.button(text=c, callback_data=f"reg_c_{c}")
-    kb.adjust(2)
-    
-    await message.answer("Выберите вашу страну/сборную из списка:", reply_markup=kb.as_markup())
-    await state.set_state(Registration.select_country)
-
-@dp.callback_query(F.data.startswith("reg_c_"))
-async def reg_country_save(callback: types.CallbackQuery, state: FSMContext):
-    country = callback.data.replace("reg_c_", "")
-    data = await state.get_data()
-    
-    db.players[callback.from_user.id] = {
-        "nick": data["nick"],
-        "country": country,
-        "active": True,
-        "last_change": 0
-    }
-    
-    await callback.message.delete()
-    await callback.message.answer(
-        f"✅ Регистрация завершена!\nНик: **{data['nick']}**\nСборная: **{country}**",
-        parse_mode="Markdown",
-        reply_markup=get_main_menu(callback.from_user.id)
-    )
-    await state.clear()
-
-# ==============================================================================
-# --- АДМИНИСТРАТИВНЫЙ БЛОК (БОЛЕЕ 200 СТРОК ЛОГИКИ) ---
-# ==============================================================================
-
-@dp.message(F.text == "⚒ Админ-панель")
-async def admin_panel_root(message: types.Message):
-    if message.from_user.id in MAIN_OWNERS or message.from_user.id in db.assistants:
-        await message.answer("🛠 Система управления EEC готова к работе.", reply_markup=get_admin_menu())
-
-@dp.message(F.text == "📊 Статистика бота")
-async def admin_stats(message: types.Message):
-    if message.from_user.id not in MAIN_OWNERS and message.from_user.id not in db.assistants: return
-    
-    msg = (
-        "📈 **Статистика системы**\n\n"
-        f"👥 Зарегистрировано игроков: {len(db.players)}\n"
-        f"🏆 Активных сборных: {len(db.teams)}\n"
-        f"📢 Проведено наборов: {db.stats['total_recruits']}\n"
-        f"🔄 Смен ников: {db.stats['total_nicks_changed']}\n"
-        f"🛰 Канал: {db.config['channel_title']}"
-    )
-    await message.answer(msg, parse_mode="Markdown")
-
-@dp.message(F.text == "🎖 Добавить ассистента")
-async def admin_add_helper_start(message: types.Message, state: FSMContext):
+@dp.message(F.text == "🛡 ДОБАВИТЬ АДМИНА")
+async def admin_add_start(message: types.Message, state: FSMContext):
     if message.from_user.id not in MAIN_OWNERS:
-        await message.answer("❌ Только владельцы могут назначать ассистентов.")
+        await message.answer("❌ Только главные владельцы могут добавлять админов.")
         return
-    await message.answer("Введите Telegram ID пользователя:", reply_markup=get_cancel_btn())
-    await state.set_state(AdminWork.add_helper_id)
+    await message.answer("Введите системный ID пользователя:", reply_markup=get_cancel_kb())
+    await state.set_state(AdminProcess.add_admin_id)
 
-@dp.message(AdminWork.add_helper_id)
-async def admin_add_helper_end(message: types.Message, state: FSMContext):
-    if message.text == "⛔️ Отменить":
+@dp.message(AdminProcess.add_admin_id)
+async def admin_add_finish(message: types.Message, state: FSMContext):
+    if message.text == "⛔️ ОТМЕНИТЬ ДЕЙСТВИЕ":
         await message.answer("Отмена.", reply_markup=get_admin_menu())
         await state.clear()
         return
     try:
         new_id = int(message.text)
-        if new_id not in db.assistants:
-            db.assistants.append(new_id)
-            await message.answer(f"✅ Пользователь {new_id} теперь ассистент.", reply_markup=get_admin_menu())
+        if new_id not in db.admins:
+            db.admins.append(new_id)
+            await message.answer(f"✅ Пользователь {new_id} теперь админ бота.", reply_markup=get_admin_menu())
         else:
             await message.answer("Он уже в списке.")
         await state.clear()
     except: await message.answer("Введите числовой ID.")
 
-@dp.message(F.text == "➕ Новая сборная")
-async def admin_create_team_1(message: types.Message, state: FSMContext):
-    if message.from_user.id not in MAIN_OWNERS and message.from_user.id not in db.assistants: return
-    await message.answer("Введите полное название сборной (например, '🇺🇦 Украина'):", reply_markup=get_cancel_btn())
-    await state.set_state(AdminWork.create_team_name)
+@dp.message(F.text == "🏗 СОЗДАТЬ СБОРНУЮ")
+async def admin_team_create_1(message: types.Message, state: FSMContext):
+    if message.from_user.id not in MAIN_OWNERS and message.from_user.id not in db.admins: return
+    await message.answer("Введите название сборной (например, 🇺🇦 Украина):", reply_markup=get_cancel_kb())
+    await state.set_state(AdminProcess.create_team_name)
 
-@dp.message(AdminWork.create_team_name)
-async def admin_create_team_2(message: types.Message, state: FSMContext):
-    if message.text == "⛔️ Отменить":
-        await message.answer("Действие отменено.", reply_markup=get_admin_menu())
+@dp.message(AdminProcess.create_team_name)
+async def admin_team_create_2(message: types.Message, state: FSMContext):
+    if message.text == "⛔️ ОТМЕНИТЬ ДЕЙСТВИЕ":
+        await message.answer("Отмена.", reply_markup=get_admin_menu())
         await state.clear()
         return
     
     t_name = message.text.strip()
-    db.teams[t_name] = {"owner": None, "coach": None, "players": [], "description": ""}
-    await message.answer(f"✅ Сборная **{t_name}** создана и добавлена в реестр.", 
-                         parse_mode="Markdown", reply_markup=get_admin_menu())
+    db.teams[t_name] = {"owner": None, "coach": None, "players": [], "history": []}
+    await message.answer(f"✅ Сборная **{t_name}** создана.", parse_mode="Markdown", reply_markup=get_admin_menu())
     await state.clear()
 
-@dp.message(F.text == "➖ Удалить сборную")
-async def admin_delete_team_1(message: types.Message, state: FSMContext):
-    if message.from_user.id not in MAIN_OWNERS and message.from_user.id not in db.assistants: return
+@dp.message(F.text == "🗑 УДАЛИТЬ СБОРНУЮ")
+async def admin_team_del_1(message: types.Message, state: FSMContext):
+    if message.from_user.id not in MAIN_OWNERS and message.from_user.id not in db.admins: return
     if not db.teams:
-        await message.answer("Список команд пуст.")
+        await message.answer("Список пуст.")
         return
     
-    builder = ReplyKeyboardBuilder()
-    for name in db.teams.keys():
-        builder.button(text=name)
-    builder.button(text="⛔️ Отменить")
-    builder.adjust(2)
+    kb = ReplyKeyboardBuilder()
+    for name in db.teams.keys(): kb.button(text=name)
+    kb.button(text="⛔️ ОТМЕНИТЬ ДЕЙСТВИЕ")
+    kb.adjust(2)
     
-    await message.answer("Выберите команду для ПОЛНОГО удаления:", reply_markup=builder.as_markup(resize_keyboard=True))
-    await state.set_state(AdminWork.delete_team_select)
+    await message.answer("Выберите сборную для удаления:", reply_markup=kb.as_markup(resize_keyboard=True))
+    await state.set_state(AdminProcess.delete_team_confirm)
 
-@dp.message(AdminWork.delete_team_select)
-async def admin_delete_team_2(message: types.Message, state: FSMContext):
-    if message.text == "⛔️ Отменить":
+@dp.message(AdminProcess.delete_team_confirm)
+async def admin_team_del_2(message: types.Message, state: FSMContext):
+    if message.text == "⛔️ ОТМЕНИТЬ ДЕЙСТВИЕ":
         await message.answer("Удаление отменено.", reply_markup=get_admin_menu())
         await state.clear()
         return
         
     if message.text in db.teams:
         del db.teams[message.text]
-        await message.answer(f"🗑 Сборная {message.text} удалена.", reply_markup=get_admin_menu())
+        await message.answer(f"🗑 Сборная {message.text} полностью удалена.", reply_markup=get_admin_menu())
         await state.clear()
 
-@dp.message(F.text == "👑 Назначить главу")
+@dp.message(F.text == "👑 НАЗНАЧИТЬ ГЛАВУ")
 async def admin_set_boss_1(message: types.Message, state: FSMContext):
-    if message.from_user.id not in MAIN_OWNERS and message.from_user.id not in db.assistants: return
+    if message.from_user.id not in MAIN_OWNERS and message.from_user.id not in db.admins: return
     
-    builder = ReplyKeyboardBuilder()
-    for name in db.teams.keys(): builder.button(text=name)
-    builder.button(text="⛔️ Отменить")
-    builder.adjust(2)
+    kb = ReplyKeyboardBuilder()
+    for name in db.teams.keys(): kb.button(text=name)
+    kb.button(text="⛔️ ОТМЕНИТЬ ДЕЙСТВИЕ")
+    kb.adjust(2)
     
-    await message.answer("Выберите сборную:", reply_markup=builder.as_markup(resize_keyboard=True))
-    await state.set_state(AdminWork.assign_owner_team)
+    await message.answer("Выберите сборную:", reply_markup=kb.as_markup(resize_keyboard=True))
+    await state.set_state(AdminProcess.set_owner_team)
 
-@dp.message(AdminWork.assign_owner_team)
+@dp.message(AdminProcess.set_owner_team)
 async def admin_set_boss_2(message: types.Message, state: FSMContext):
-    if message.text == "⛔️ Отменить":
+    if message.text == "⛔️ ОТМЕНИТЬ ДЕЙСТВИЕ":
         await message.answer("Отмена.", reply_markup=get_admin_menu())
         await state.clear()
         return
-    await state.update_data(target_team=message.text)
-    await message.answer(f"Введите Telegram ID владельца для {message.text}:", reply_markup=get_cancel_btn())
-    await state.set_state(AdminWork.assign_owner_id)
+    await state.update_data(target_t=message.text)
+    await message.answer(f"Введите Telegram ID владельца для {message.text}:", reply_markup=get_cancel_kb())
+    await state.set_state(AdminProcess.set_owner_id)
 
-@dp.message(AdminWork.assign_owner_id)
+@dp.message(AdminProcess.set_owner_id)
 async def admin_set_boss_3(message: types.Message, state: FSMContext):
-    if message.text == "⛔️ Отменить": return
+    if message.text == "⛔️ ОТМЕНИТЬ ДЕЙСТВИЕ": return
     try:
         new_boss_id = int(message.text)
         data = await state.get_data()
-        team = data["target_team"]
+        team = data["target_t"]
         
         db.teams[team]["owner"] = new_boss_id
-        await message.answer(f"✅ Владелец сборной {team} изменен.", reply_markup=get_admin_menu())
+        await message.answer(f"✅ Владелец {team} обновлен.", reply_markup=get_admin_menu())
         
-        # Уведомляем нового владельца
         try:
             await bot.send_message(new_boss_id, f"👑 Вы назначены владельцем сборной {team}!", 
                                    reply_markup=get_main_menu(new_boss_id))
@@ -452,227 +460,323 @@ async def admin_set_boss_3(message: types.Message, state: FSMContext):
         await state.clear()
     except: await message.answer("ID должен быть цифровым.")
 
+@dp.message(F.text == "📊 СТАТИСТИКА БОТА")
+async def admin_global_stats(message: types.Message):
+    if message.from_user.id not in MAIN_OWNERS and message.from_user.id not in db.admins: return
+    
+    msg = (
+        "📊 **Глобальная статистика EEC**\n\n"
+        f"👤 Зарегистрировано: {len(db.players)}\n"
+        f"🏆 Сборных создано: {len(db.teams)}\n"
+        f"📢 Опубликовано наборов: {db.stats['total_recruits']}\n"
+        f"🔄 Смен ников: {db.stats['total_nicks']}\n"
+        f"📉 Карьерных изменений: {db.stats['total_career_changes']}\n\n"
+        f"🛰 Активный канал: {db.config['channel_name']}"
+    )
+    await message.answer(msg, parse_mode="Markdown")
+
 # ==============================================================================
-# --- УПРАВЛЕНИЕ СБОРНОЙ (ВЛАДЕЛЬЦЫ / ТРЕНЕРЫ) ---
+# --- УПРАВЛЕНИЕ КОМАНДОЙ (ЛИДЕРЫ) ---
 # ==============================================================================
 
-@dp.message(F.text == "📣 Создать набор")
-async def lead_recruit_init(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    # Проверяем, в какой команде юзер — власть
-    team = next((n for n, d in db.teams.items() if d["owner"] == user_id or d["coach"] == user_id), None)
+@dp.message(F.text == "📋 МОЯ СБОРНАЯ")
+async def team_view_roster(message: types.Message):
+    uid = message.from_user.id
+    team_name = next((n for n, d in db.teams.items() if d["owner"] == uid or d["coach"] == uid), None)
+    if not team_name: return
     
-    if not team: return
-    if not db.config["channel_id"]:
-        await message.answer("❌ Канал публикации не настроен. Обратитесь к администратору.")
+    t_data = db.teams[team_name]
+    roster = "📋 **Состав команды:**\n\n"
+    for i, pid in enumerate(t_data["players"], 1):
+        p_nick = db.players.get(pid, {}).get("nick", "Unknown")
+        roster += f"{i}. {p_nick} (ID: {pid})\n"
+        
+    if not t_data["players"]: roster += "В составе пока пусто."
+    
+    await message.answer(roster, parse_mode="Markdown")
+
+@dp.message(F.text == "📢 ОБЪЯВИТЬ НАБОР")
+async def team_recruit_init(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    team = next((n for n, d in db.teams.items() if d["owner"] == uid or d["coach"] == uid), None)
+    
+    if not team or not db.config["channel_id"]:
+        await message.answer("❌ Канал не привязан или у вас нет прав.")
         return
         
-    await message.answer(f"📢 **Создание набора для {team}**\n\nВведите текст объявления (требования, время и т.д.):", 
-                         parse_mode="Markdown", reply_markup=get_cancel_btn())
-    await state.set_state(TeamManagement.recruit_text_input)
+    await message.answer(f"📢 **Набор в {team}**\nВведите текст объявления:", 
+                         reply_markup=get_cancel_kb())
+    await state.set_state(TeamManagement.recruit_desc)
 
-@dp.message(TeamManagement.recruit_text_input)
-async def lead_recruit_send(message: types.Message, state: FSMContext):
-    if message.text == "⛔️ Отменить":
-        await message.answer("Набор отменен.", reply_markup=get_main_menu(message.from_user.id))
+@dp.message(TeamManagement.recruit_desc)
+async def team_recruit_publish(message: types.Message, state: FSMContext):
+    if message.text == "⛔️ ОТМЕНИТЬ ДЕЙСТВИЕ":
+        await message.answer("Отмена.", reply_markup=get_main_menu(message.from_user.id))
         await state.clear()
         return
 
-    user_id = message.from_user.id
-    team = next((n for n, d in db.teams.items() if d["owner"] == user_id or d["coach"] == user_id), None)
-    
+    uid = message.from_user.id
+    team = next((n for n, d in db.teams.items() if d["owner"] == uid or d["coach"] == uid), None)
     db.stats["total_recruits"] += 1
-    contact = f"@{message.from_user.username}" if message.from_user.username else f"ID: {user_id}"
     
+    contact = f"@{message.from_user.username}" if message.from_user.username else f"ID: {uid}"
     post = (
-        "🔥 **ОБЪЯВЛЕН НАБОР В СБОРНУЮ** 🔥\n\n"
-        f"🏆 Команда: **{team}**\n"
-        f"👤 Ответственный: {contact}\n\n"
-        f"📝 **Информация:**\n{message.text}\n\n"
-        "Писать строго по контакту выше! ⤴️"
+        "⚡️ **ОТКРЫТ НАБОР В СБОРНУЮ!** ⚡️\n\n"
+        f"🏆 Сборная: **{team}**\n"
+        f"📝 Инфо: {message.text}\n"
+        f"👤 Контакт: {contact}"
     )
 
     try:
         await bot.send_message(db.config["channel_id"], post, parse_mode="Markdown")
-        await message.answer("✅ Набор успешно опубликован в канале!", reply_markup=get_main_menu(user_id))
-    except Exception as e:
-        await message.answer(f"❌ Ошибка публикации: {e}")
-    
+        await message.answer("✅ Набор опубликован в канале!", reply_markup=get_main_menu(uid))
+    except:
+        await message.answer("❌ Ошибка при отправке в канал.")
     await state.clear()
 
-@dp.message(F.text == "📞 Вызвать игрока")
-async def lead_invite_start(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    team = next((n for n, d in db.teams.items() if d["owner"] == user_id or d["coach"] == user_id), None)
+@dp.message(F.text == "👢 ИСКЛЮЧИТЬ")
+async def team_kick_start(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    team_name = next((n for n, d in db.teams.items() if d["owner"] == uid or d["coach"] == uid), None)
+    if not team_name: return
+    
+    t_data = db.teams[team_name]
+    if not t_data["players"]:
+        await message.answer("В команде нет игроков.")
+        return
+        
+    kb = ReplyKeyboardBuilder()
+    for pid in t_data["players"]:
+        p_nick = db.players.get(pid, {}).get("nick", f"ID:{pid}")
+        kb.button(text=f"Kick: {p_nick}", callback_data=f"kick_{pid}")
+    
+    kb.adjust(1)
+    await message.answer("Выберите игрока для исключения из сборной:", reply_markup=kb.as_markup())
+
+@dp.callback_query(F.data.startswith("kick_"))
+async def team_kick_execute(cb: types.CallbackQuery):
+    target_pid = int(cb.data.replace("kick_", ""))
+    uid = cb.from_user.id
+    team_name = next((n for n, d in db.teams.items() if d["owner"] == uid or d["coach"] == uid), None)
+    
+    if target_pid in db.teams[team_name]["players"]:
+        db.teams[team_name]["players"].remove(target_pid)
+        await cb.message.edit_text(f"✅ Игрок (ID: {target_pid}) был исключен из состава.")
+        try:
+            await bot.send_message(target_pid, f"❗️ Вы были исключены из состава сборной {team_name}.")
+        except: pass
+    else:
+        await cb.answer("Игрок уже не в составе.")
+
+@dp.message(F.text == "➕ ПРИГЛАСИТЬ")
+async def team_invite_1(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    team = next((n for n, d in db.teams.items() if d["owner"] == uid or d["coach"] == uid), None)
     if not team: return
     
-    await message.answer("Введите @username игрока (тег), которого хотите пригласить:", reply_markup=get_cancel_btn())
-    await state.set_state(TeamManagement.invite_player_username)
+    await message.answer("Введите @username игрока для приглашения:", reply_markup=get_cancel_kb())
+    await state.set_state(TeamManagement.invite_tag)
 
-@dp.message(TeamManagement.invite_player_username)
-async def lead_invite_end(message: types.Message, state: FSMContext):
-    if message.text == "⛔️ Отменить":
+@dp.message(TeamManagement.invite_tag)
+async def team_invite_2(message: types.Message, state: FSMContext):
+    if message.text == "⛔️ ОТМЕНИТЬ ДЕЙСТВИЕ":
         await message.answer("Отмена.", reply_markup=get_main_menu(message.from_user.id))
         await state.clear()
         return
         
     username = message.text.replace("@", "").lower().strip()
-    target_id = db.usernames.get(username)
+    target_id = db.user_index.get(username)
     
     if not target_id:
-        await message.answer("❌ Игрок не найден. Он должен запустить бота хотя бы один раз.")
+        await message.answer("❌ Этот игрок не зарегистрирован в боте.")
         return
         
     team = next((n for n, d in db.teams.items() if d["owner"] == message.from_user.id or d["coach"] == message.from_user.id), None)
     
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Вступить", callback_data=f"join_{team}")
-    kb.button(text="❌ Отклонить", callback_data="decline_inv")
+    ikb = InlineKeyboardBuilder()
+    ikb.button(text="✅ ПРИНЯТЬ", callback_data=f"accept_team_{team}")
+    ikb.button(text="❌ ОТКАЗАТЬСЯ", callback_data="refuse_invite")
     
     try:
-        await bot.send_message(target_id, f"⚡️ Вас приглашают в основной состав сборной **{team}**!\nПринимаете вызов?", 
-                               parse_mode="Markdown", reply_markup=kb.as_markup())
-        await message.answer(f"✅ Приглашение отправлено игроку @{username}.", reply_markup=get_main_menu(message.from_user.id))
+        await bot.send_message(target_id, f"🎮 Вас приглашают в основной состав сборной **{team}**!\n\nПринимаете вызов?", 
+                               parse_mode="Markdown", reply_markup=ikb.as_markup())
+        await message.answer(f"✅ Приглашение отправлено @{username}.", reply_markup=get_main_menu(message.from_user.id))
     except:
-        await message.answer("❌ Не удалось отправить приглашение (бот заблокирован).")
+        await message.answer("❌ Личные сообщения игрока закрыты.")
     await state.clear()
 
-@dp.callback_query(F.data.startswith("join_"))
-async def callback_join_handler(callback: types.CallbackQuery):
-    team_name = callback.data.replace("join_", "")
-    user_id = callback.from_user.id
+@dp.callback_query(F.data.startswith("accept_team_"))
+async def callback_accept_invite(cb: types.CallbackQuery):
+    t_name = cb.data.replace("accept_team_", "")
+    uid = cb.from_user.id
     
-    if team_name in db.teams:
-        if user_id not in db.teams[team_name]["players"]:
-            db.teams[team_name]["players"].append(user_id)
-            await callback.message.edit_text(f"🎉 Поздравляем! Вы теперь в составе {team_name}.")
+    if t_name in db.teams:
+        if uid not in db.teams[t_name]["players"]:
+            db.teams[t_name]["players"].append(uid)
+            await cb.message.edit_text(f"🎉 Вы стали участником сборной {t_name}!")
             
-            # Сообщение владельцу
-            owner = db.teams[team_name]["owner"]
+            # Лог владельцу
+            owner = db.teams[t_name]["owner"]
             if owner:
-                p_nick = db.players.get(user_id, {}).get("nick", "Игрок")
-                try:
-                    await bot.send_message(owner, f"🔔 Игрок {p_nick} принял ваш вызов в сборную!")
+                p_nick = db.players.get(uid, {}).get("nick", "Игрок")
+                try: await bot.send_message(owner, f"🔔 {p_nick} вступил в вашу сборную!")
                 except: pass
         else:
-            await callback.message.answer("Вы уже состоите в этой сборной.")
+            await cb.message.answer("Вы уже в этой команде.")
 
 # ==============================================================================
-# --- ОБЩИЕ ФУНКЦИИ (КАРЬЕРА, ПРОФИЛЬ) ---
+# --- ОБЩАЯ РЕГИСТРАЦИЯ И СТАРТ ---
 # ==============================================================================
 
-@dp.message(F.text == "🏁 Завершить карьеру")
-async def profile_stop(message: types.Message):
-    u_id = message.from_user.id
-    if u_id in db.players:
-        db.players[u_id]["active"] = False
-        await message.answer("🛑 Вы официально завершили карьеру игрока.")
-
-@dp.message(F.text == "🔙 Возобновить карьеру")
-async def profile_resume(message: types.Message):
-    u_id = message.from_user.id
-    if u_id in db.players:
-        db.players[u_id]["active"] = True
-        await message.answer("🚀 Поздравляем с возвращением в большой спорт!")
-
-@dp.message(F.text == "👤 Мой профиль")
-async def profile_view(message: types.Message):
-    u_id = message.from_user.id
-    if u_id not in db.players: return
+@dp.message(Command("start"))
+async def cmd_start_handler(message: types.Message, state: FSMContext):
+    await state.clear()
+    uid = message.from_user.id
     
-    p = db.players[u_id]
-    team_found = "Не состоит"
+    # Индексируем username
+    if message.from_user.username:
+        db.user_index[message.from_user.username.lower()] = uid
+    
+    if uid in db.players:
+        p = db.players[uid]
+        await message.answer(
+            f"👋 С возвращением, {p['nick']}!\n"
+            f"Твой статус: {'🏃 Активен' if p['active'] else '🛑 Неактивен'}",
+            reply_markup=get_main_menu(uid)
+        )
+    else:
+        await message.answer("👋 Добро пожаловать в EEC Bot!\nПожалуйста, введите ваш игровой ник Roblox:")
+        await state.set_state(Registration.nick)
+
+@dp.message(Registration.nick)
+async def reg_nick_catch(message: types.Message, state: FSMContext):
+    nick = message.text.strip()
+    if len(nick) < 2:
+        await message.answer("Слишком короткий ник.")
+        return
+    await state.update_data(nick=nick)
+    
+    builder = InlineKeyboardBuilder()
+    for country in db.countries:
+        builder.button(text=country, callback_data=f"reg_country_{country}")
+    builder.adjust(2)
+    
+    await message.answer("Выберите вашу страну/сборную:", reply_markup=builder.as_markup())
+    await state.set_state(Registration.country)
+
+@dp.callback_query(F.data.startswith("reg_country_"))
+async def reg_country_catch(cb: types.CallbackQuery, state: FSMContext):
+    country = cb.data.replace("reg_country_", "")
+    data = await state.get_data()
+    
+    db.players[cb.from_user.id] = {
+        "nick": data["nick"],
+        "country": country,
+        "active": True,
+        "nick_cd": 0,
+        "career_cd": 0
+    }
+    
+    await cb.message.delete()
+    await cb.message.answer(
+        f"✅ Регистрация прошла успешно!\nНик: **{data['nick']}**\nСборная: **{country}**",
+        parse_mode="Markdown",
+        reply_markup=get_main_menu(cb.from_user.id)
+    )
+    await state.clear()
+
+# ==============================================================================
+# --- ПРОФИЛЬ И СЕРВИСЫ ---
+# ==============================================================================
+
+@dp.message(F.text == "👤 МОЙ ПРОФИЛЬ")
+async def profile_show_handler(message: types.Message):
+    uid = message.from_user.id
+    if uid not in db.players: return
+    
+    p = db.players[uid]
+    team = "Не состоит"
     for n, d in db.teams.items():
-        if u_id in d["players"]:
-            team_found = n
+        if uid in d["players"]:
+            team = n
             break
             
     msg = (
-        "👤 **Ваш профиль игрока**\n\n"
+        "👤 **ВАШ ПРОФИЛЬ ИГРОКА**\n\n"
         f"🏷 Ник: `{p['nick']}`\n"
         f"🌍 Сборная: {p['country']}\n"
-        f"🏆 Команда: {team_found}\n"
+        f"🏆 Команда: {team}\n"
         f"📈 Статус: {'🏃 Активен' if p['active'] else '🛑 На пенсии'}\n"
-        f"🆔 Ваш ID: `{u_id}`"
+        f"🆔 Telegram ID: `{uid}`"
     )
     await message.answer(msg, parse_mode="Markdown")
 
-@dp.message(F.text == "📋 Состав сборной")
-async def lead_team_view(message: types.Message):
-    user_id = message.from_user.id
-    team_name = next((n for n, d in db.teams.items() if d["owner"] == user_id or d["coach"] == user_id), None)
-    if not team_name: return
-    
-    team = db.teams[team_name]
-    players_str = ""
-    for idx, pid in enumerate(team["players"], 1):
-        p_data = db.players.get(pid, {"nick": "Неизвестный"})
-        players_str += f"{idx}. {p_data['nick']} (ID: {pid})\n"
-        
-    if not players_str: players_str = "В составе пока нет игроков."
-    
-    await message.answer(f"🚩 **Состав {team_name}**\n\n{players_str}", parse_mode="Markdown")
-
-@dp.message(F.text == "✉️ Написать владельцу")
-async def contact_boss_1(message: types.Message, state: FSMContext):
+@dp.message(F.text == "✉️ СВЯЗЬ С ГЛАВОЙ")
+async def contact_boss_init(message: types.Message, state: FSMContext):
     if not db.teams:
-        await message.answer("Список команд пуст.")
+        await message.answer("Команд нет.")
         return
     kb = ReplyKeyboardBuilder()
     for name in db.teams.keys(): kb.button(text=name)
-    kb.button(text="⛔️ Отменить")
+    kb.button(text="⛔️ ОТМЕНИТЬ ДЕЙСТВИЕ")
     kb.adjust(2)
-    await message.answer("Кому хотите отправить сообщение?", reply_markup=kb.as_markup(resize_keyboard=True))
-    await state.set_state(TeamManagement.message_to_owner_team)
+    await message.answer("Кому хотите написать?", reply_markup=kb.as_markup(resize_keyboard=True))
+    await state.set_state(TeamManagement.contact_owner_team)
 
-@dp.message(TeamManagement.message_to_owner_team)
-async def contact_boss_2(message: types.Message, state: FSMContext):
-    if message.text == "⛔️ Отменить":
+@dp.message(TeamManagement.contact_owner_team)
+async def contact_boss_step2(message: types.Message, state: FSMContext):
+    if message.text == "⛔️ ОТМЕНИТЬ ДЕЙСТВИЕ":
         await message.answer("Отмена.", reply_markup=get_main_menu(message.from_user.id))
         await state.clear()
         return
     await state.update_data(target=message.text)
-    await message.answer(f"Введите текст сообщения для владельца {message.text}:", reply_markup=get_cancel_btn())
-    await state.set_state(TeamManagement.message_to_owner_text)
+    await message.answer(f"Введите сообщение для владельца {message.text}:", reply_markup=get_cancel_kb())
+    await state.set_state(TeamManagement.contact_owner_text)
 
-@dp.message(TeamManagement.message_to_owner_text)
-async def contact_boss_3(message: types.Message, state: FSMContext):
-    if message.text == "⛔️ Отменить": return
+@dp.message(TeamManagement.contact_owner_text)
+async def contact_boss_final(message: types.Message, state: FSMContext):
+    if message.text == "⛔️ ОТМЕНИТЬ ДЕЙСТВИЕ": return
     data = await state.get_data()
     team = db.teams.get(data["target"])
     
     if team and team["owner"]:
         try:
-            sender_nick = db.players[message.from_user.id]["nick"]
-            sender_tag = f"@{message.from_user.username}" if message.from_user.username else "нет тега"
+            nick = db.players[message.from_user.id]["nick"]
             await bot.send_message(team["owner"], 
-                                   f"📩 **Новое обращение!**\nОт: {sender_nick} ({sender_tag})\n\nТекст: {message.text}", 
+                                   f"📩 **Новое обращение!**\nОт: {nick}\n\nТекст: {message.text}", 
                                    parse_mode="Markdown")
-            await message.answer("✅ Сообщение успешно доставлено!", reply_markup=get_main_menu(message.from_user.id))
-        except: await message.answer("❌ Ошибка доставки.")
+            await message.answer("✅ Сообщение отправлено!", reply_markup=get_main_menu(message.from_user.id))
+        except: await message.answer("Ошибка доставки.")
     await state.clear()
 
-@dp.message(F.text == "🏠 Главное меню")
-async def back_to_root(message: types.Message, state: FSMContext):
+@dp.message(F.text == "🏠 ГЛАВНОЕ МЕНЮ")
+async def back_to_main(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("Вы вернулись в главное меню.", reply_markup=get_main_menu(message.from_user.id))
+    await message.answer("Возврат в меню.", reply_markup=get_main_menu(message.from_user.id))
 
 # ==============================================================================
-# --- ЗАПУСК БОТА ---
+# --- ЗАПУСК ЯДРА БОТА ---
 # ==============================================================================
 
 async def main_engine():
-    print("EEC BOT v7.0: ENGINE STARTING...")
-    print(f"ADMINS CONFIGURED: {MAIN_OWNERS}")
+    print("--- SYSTEM STARTING ---")
+    print(f"--- BOT TIME: {datetime.datetime.now()} ---")
     
-    # Удаляем вебхуки и запускаем чистый поллинг
+    # Регистрация системных команд
     await bot.delete_webhook(drop_pending_updates=True)
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Запуск / Регистрация"),
+        BotCommand(command="profile", description="Профиль"),
+        BotCommand(command="admin", description="Админка (для админов)")
+    ])
+    
+    # Старт поллинга
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main_engine())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Бот остановлен вручную.")
-    except Exception as fatal:
-        logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА: {fatal}")
+        logger.info("Bot stopped by user.")
+    except Exception as e:
+        logger.critical(f"CRITICAL SYSTEM ERROR: {e}")
